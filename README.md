@@ -1,92 +1,182 @@
+
 # Decision-Centric Fine-Tuning for Visual Language Models (VLMs) in GUI Automation
 
-This repository implements an autonomous GUI Automation Agent that observes the computer screen, interprets UI context using a Vision-Language Model (VLM), and selects the next action using a decision-centric offline reinforcement learning pipeline.
+Modern GUIs are visually rich but *structurally inconsistent* environments. Elements shift, screens differ across devices, and there is no stable "API" for UI state. Traditional RPA relies on template matching or brittle pixel coordinates. Even advanced Vision-Language Models (VLMs) like GPT-4V can **describe** what they see but cannot **act** on the interface with reliability or intent.
 
-Traditional GUI automation relies on brittle rule scripts or template-based coordinates. Even modern VLMs like GPT-4V can understand UI elements but cannot decide what to do next. This project enables VLMs to act, not just describe.
+This project addresses this gap by reframing GUI automation as a **sequential decision-making problem**, and enabling a **Vision-Language Model to become an agent**, not just a recognizer. Our system combines:
 
----
+- A **1.3B parameter multimodal VLM** for UI perception
+- A **decision-centric offline RL training pipeline** for action reasoning
+- **Advantage-weighted policy updates** to learn *why* certain actions lead to success
+- **vLLM + DeepSpeed inference/training optimization** for deployment scale
 
-## Key Contributions
-
-- **1.3B Parameter VLM Backbone** for multimodal UI reasoning.
-- **Decision-Centric Fine-Tuning** that shifts the VLM from description to action.
-- **Offline PPO with Advantage-Weighted Updates**, enabling safe learning without live interaction.
-- **Stochastic-Aware Advantage Estimation** for stability under UI layout changes and noise.
-- **vLLM + DeepSpeed Integration** for scalable inference and training.
-- **53.8% Task Success Rate**, outperforming GPT-4V (8.3%) and CogAgent (38.5%).
+The result: a model that **interprets screen state, chooses the next step, and executes actions**, achieving robust end-to-end performance across real GUI workflows.
 
 ---
 
-## Why This Matters
+## 🌍 Core Problem & Motivation
 
-Enterprise software, CRMs, SaaS dashboards, and vendor portals depend heavily on GUIs.  
-However:
+### Why GUI Automation Is Hard
+| Challenge | Why It Breaks Traditional Methods |
+|---------|-----------------------------------|
+| UI layouts shift dynamically | Hard-coded coordinates become invalid |
+| Visual similarity across elements | Template matching confuses lookalikes |
+| Mixed-modal semantics (icons, text, spatial cues) | Requires reasoning, not just detection |
+| Long multi-step workflows | Needs planning, memory, and feedback |
 
-- Rule-based RPA breaks when UI layouts change.
-- Supervised fine-tuning overfits to absolute screen coordinates.
-- VLMs without reinforcement learning lack sequential decision reasoning.
+Supervised fine-tuning on GUI demonstrations *only teaches imitation*.  
+It cannot teach **why** one action is better than another, especially when:
 
-This project reframes GUI control as a sequential decision-making problem.
+- Multiple actions *appear reasonable*, but only one progresses the task
+- Layout or element order changes between environments
+- Observations are noisy (scroll offsets, dialog popups, shadows, etc.)
 
----
+A **model that *understands what to do next*** must reason in terms of **action value**, not just visual description.
 
-## Architecture
-
-Screen Capture → Vision-Language Model (vLLM + DeepSpeed)
-↓
-Action Distribution
-↓
-Offline PPO (Advantage-Weighted)
-↓
-UI Executor
+This is why reinforcement learning is necessary.
 
 ---
 
-## Training Pipeline
+## 🎯 Key Insight
 
-### 1) Supervised Warm-Up (BC)
-The model learns to imitate expert demonstration trajectories.
+> Vision-Language Models already understand UI semantics.  
+> What they *lack* is a decision-making prior.
 
-### 2) Decision-Centric Offline PPO
-The model improves by reweighting high-advantage actions:
+Instead of training the model to **describe** the UI ("There is a blue Submit button"), we train it to **choose**:
+```
+Given the current screen,
+what *action* most increases the probability of completing the task?
+```
 
-π_new(a|s) ∝ π_old(a|s) * exp(A(s,a) / β)
-
-This enables policy optimization **without interacting with live software**.
-
----
-
-## Results
-
-| Model / Agent | Task Success Rate |
-|--------------|------------------|
-| **This Work (1.3B VLM + Offline PPO)** | **53.8%** |
-| CogAgent (Vision-Action) | 38.5% |
-| GPT-4V (Prompted Reasoning) | 8.3% |
-| Supervised Baseline Only | 24.3% |
+This shift is **decision-centric fine-tuning**.
 
 ---
 
-## Repository Structure
+## 🧠 System Overview
 
-data.py # Dataset structures and replay buffer
-env_utils.py # Screen capture + environment wrappers
-labeling.py # Action labeling and preprocessing
-offline_rl.py # Advantage-weighted offline PPO
-offline_rl_gui_2.py # Main training pipeline
-offline_RL_GUIagent.py # Runtime inference agent
-offline_gui_vllm_deepspeed.py # VLM acceleration wrapper
-GUIAgent.md # System conceptual documentation
+```
+              (1) Screen Observation
+                      ↓
+          [ Vision-Language Model ]
+               (Scene Understanding)
+                      ↓
+              Action Distribution π(a|s)
+                      ↓
+      [ Offline PPO with Advantage Weighting ]
+         (Reinforce good decisions, suppress bad)
+                      ↓
+               Environment Executor
+              (Click, Scroll, Drag)
+```
+
+- The VLM extracts *semantic scene embeddings* (text, icons, structure).
+- The RL layer biases the model toward *state-progressing actions*.
 
 ---
 
-## Installation
+## 🏋️ Training Pipeline — Full Thinking Flow
+
+### Stage 0 — Collect Demonstration Trajectories
+We gather ~700k UI interaction steps from expert or semi-expert operators.
+
+These demonstrations **do not need to be perfect**.  
+This is intentional — variability allows the advantage estimator to learn *quality differences* between actions.
+
+### Stage 1 — Supervised Behavioral Cloning (Warm Start)
+We first teach the model:
+```
+Given a screen, predict the human-chosen action.
+```
+This ensures:
+- The VLM learns spatial grounding (what elements correspond to actions)
+- The policy begins in a *reasonable region* of action space
+- RL does not start from random behavior (avoiding collapse)
+
+**But supervised BC alone overfits screen-position correlations**, not action logic.
+
+### Stage 2 — Decision-Centric Offline RL (Offline PPO)
+For each (state, action) we compute an **advantage score**:
+```
+A(s,a) = Q(s,a) - V(s)
+```
+This measures whether the chosen action was **better or worse than typical** in that same state.
+
+We then update the policy:
+```
+π_new(a|s) ∝ π_old(a|s) * exp(A(s,a)/β)
+```
+
+Interpretation:
+- **Good actions** (positive advantage) are strengthened exponentially
+- **Bad actions** are naturally suppressed without forcing discontinuities
+- β controls exploration vs. conservativeness (lower β = sharper updates)
+
+This creates a stable **policy improvement cycle** **without any online interaction**.
+
+---
+
+## 📈 Results — What Changed After RL?
+
+| Model Variant | Behavior | Failure Modes | Success Rate |
+|--------------|----------|---------------|---------------|
+| GPT-4V Prompting | Can describe UI but cannot act | No sequential planning | 8.3% |
+| Supervised BC Only | Clicks correct elements sometimes | Overfits layout | 24.3% |
+| CogAgent (Vision → Action) | Hard-coded action heuristics | Limited planning | 38.5% |
+| **This Work** (BC → Offline PPO) | Understands *progress vs. no-progress* states | Robust across UI variation | **53.8%** |
+
+---
+
+## ⚙️ Repository Structure — Designed for Interpretability
+
+```
+data.py                       # Replay buffer + trajectory abstractions
+env_utils.py                  # Screen capture + UI environment stubs
+labeling.py                   # Demonstration preprocessing + tokenization
+offline_rl.py                 # Core advantage-weighted policy update logic
+offline_rl_gui_2.py           # Full pipeline (BC + RL training stages)
+offline_RL_GUIagent.py        # Action loop for real GUI execution
+offline_gui_vllm_deepspeed.py # Scalable inference (zero-copy KV caching)
+GUIAgent.md                   # System diagrams & conceptual documentation
+```
+
+---
+
+## 🚀 Installation & Execution
 
 ```bash
 conda create -n gui-agent python=3.10
 conda activate gui-agent
 pip install -r requirements.txt
+
+# Convert human demonstrations to training tensors
 python labeling.py --input trajectories/ --output demos.pt
+
+# Stage 1: Behavioral Cloning
 python offline_rl_gui_2.py --stage bc
+
+# Stage 2: Offline PPO (Decision-Centric Fine-Tuning)
 python offline_rl_gui_2.py --stage rl
+
+# Run agent live
 python offline_RL_GUIagent.py --model checkpoint/
+```
+
+---
+
+## 🧭 Future Work
+
+- Incorporate **self-generated counterfactual rollouts**
+- Add **hierarchical action abstraction** (macro-actions)
+- Vision transformer distillation for **mobile on-device UI agents**
+
+---
+
+## 📩 Contact
+
+This project is actively being extended.
+For collaboration, research discussion, or benchmarking access:
+
+```
+Maintainer: Fang Sun
+Role: Researcher — Decision-Centric VLM Control
+```
